@@ -7,8 +7,8 @@ import re
 
 class Id:
     b62 = Base62.create_instance_with_inverted_character_set()
-    uri_pattern: str
-    mercury_pattern: str
+    uri_pattern: str = None
+    mercury_pattern: str = None
 
     def __init__(self, _id: str):
         self.__id = _id
