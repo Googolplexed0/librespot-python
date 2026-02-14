@@ -202,13 +202,13 @@ class ApiClient(Closeable):
 
         body = response.content
         if body is None:
-            raise ConnectionError("Extended Metadata request failed: No response body")
+            raise ConnectionError("Extended Metadata request for {} failed: No response body".format(uri))
 
         proto = BatchedExtensionResponse()
         proto.ParseFromString(body)
         entityextd = proto.extended_metadata.pop().extension_data.pop()
         if entityextd.header.status_code != 200:
-            raise ConnectionError("Extended Metadata request failed: Status code {}".format(entityextd.header.status_code))
+            raise ConnectionError("Extended Metadata request for {} failed: Status code {}".format(uri, entityextd.header.status_code))
         mdb: bytes = entityextd.extension_data.value
         return mdb
 
@@ -267,20 +267,20 @@ class ApiClient(Closeable):
         md.ParseFromString(mdb)
         return md
 
-    def get_playlist(self,
-                     _id: PlaylistId) -> Playlist4External.SelectedListContent:
+    def get_playlist(self, playlist: PlaylistId) -> Playlist4External.SelectedListContent:
         """
 
-        :param _id: PlaylistId:
+        :param playlist: PlaylistId:
 
         """
-        response = self.send("GET",
-                             "/playlist/v2/playlist/{}".format(_id.id()), None,
-                             None)
+        response = self.send("GET", "/playlist/v2/playlist/{}".format(playlist.id()),
+                             None, None)
         ApiClient.StatusCodeException.check_status(response)
+        
         body = response.content
         if body is None:
-            raise IOError()
+            raise ConnectionError("Playlist Metadata request for {} failed: No response body".format(playlist.to_spotify_uri()))
+        
         proto = Playlist4External.SelectedListContent()
         proto.ParseFromString(body)
         return proto
