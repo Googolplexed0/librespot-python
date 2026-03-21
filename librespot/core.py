@@ -1068,7 +1068,7 @@ class Session(Closeable, MessageListener, SubListener):
         try:
             ap_response_message_length = self.connection.read_int()
         except struct.error:
-            time.sleep(.1)
+            time.sleep(1)
             ap_response_message_length = self.connection.read_int()
         acc.write_int(ap_response_message_length)
         ap_response_message_bytes = self.connection.read(
