@@ -1065,7 +1065,11 @@ class Session(Closeable, MessageListener, SubListener):
         acc.write_int(2 + 4 + len(client_hello_bytes))
         acc.write(client_hello_bytes)
         # Read APResponseMessage
-        ap_response_message_length = self.connection.read_int()
+        try:
+            ap_response_message_length = self.connection.read_int()
+        except struct.error:
+            time.sleep(.1)
+            ap_response_message_length = self.connection.read_int()
         acc.write_int(ap_response_message_length)
         ap_response_message_bytes = self.connection.read(
             ap_response_message_length - 4)
