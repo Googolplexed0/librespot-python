@@ -285,6 +285,34 @@ class ApiClient(Closeable):
         proto.ParseFromString(body)
         return proto
 
+    def get_user_profile(self, username: str, playlist_limit: int = None, artist_limit: int = None) -> dict[str, typing.Any]:
+        """
+
+        :param user: str:
+        :param playlist_limit: int:  (Default value = None)
+        :param artist_limit: int:  (Default value = None)
+
+        """
+
+        suffix = "/user-profile-view/v3/profile/{}".format(username)
+        if playlist_limit is not None or artist_limit is not None:
+            suffix += "?"
+            if playlist_limit is not None:
+                suffix += "playlist_limit={}".format(playlist_limit)
+                if artist_limit is not None:
+                    suffix += "&"
+            if artist_limit is not None:
+                suffix += "artist_limit={}".format(artist_limit)
+
+        response = self.send("GET", suffix, None, None)
+        ApiClient.StatusCodeException.check_status(response)
+
+        body = response.content
+        if body is None:
+            raise ConnectionError("User Profile request for {} failed: No response body".format(username))
+
+        return response.json()
+
     def set_client_token(self, client_token):
         """
 
