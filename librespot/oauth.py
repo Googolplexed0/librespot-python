@@ -121,6 +121,9 @@ class OAuth:
             raise RuntimeError("Received status code %d: %s" % (response.status_code, response.reason))
         return self.ingest_token_response(response.json())
 
+    def has_token(self):
+        return bool(self.__token)
+
     def token(self):
         if not self.__token:
             raise RuntimeError("You need to request a token bore!")
@@ -205,6 +208,6 @@ class OAuth:
         self.request_token()
         return self.get_credentials()
 
-    def __close(self):
+    def close(self):
         if self.__server:
             self.__server.shutdown()

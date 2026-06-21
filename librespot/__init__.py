@@ -6,7 +6,7 @@ import platform
 
 
 class Version:
-    version_name = "0.0.11"
+    version_name = "0.0.12"
 
     @staticmethod
     def platform() -> Platform:
