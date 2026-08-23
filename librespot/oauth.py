@@ -73,7 +73,8 @@ class OAuth:
 
     def ingest_token_response(self, result):
         self.__token = result["access_token"]
-        self.__refresh_token = result["refresh_token"]
+        if "refresh_token" in result:
+            self.__refresh_token = result["refresh_token"]
         if "expires_in" in result:
             self.__token_expires_at = datetime.now() + timedelta(seconds=result["expires_in"])
         elif "expires_at" in result:

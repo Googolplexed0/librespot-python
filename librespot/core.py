@@ -1179,6 +1179,20 @@ class Session(Closeable, MessageListener, SubListener):
         client = requests.Session()
         return client
 
+    def credentials(self) -> dict:
+        ap_welcome = self.ap_welcome()
+        reusable = ap_welcome.reusable_auth_credentials
+        reusable_type = Authentication.AuthenticationType.Name(
+            ap_welcome.reusable_auth_credentials_type)
+        return {
+            "username":
+            ap_welcome.canonical_username,
+            "credentials":
+            base64.b64encode(reusable).decode(),
+            "type":
+            reusable_type,
+        }
+
     def dealer(self) -> DealerClient:
         """ """
         self.__wait_auth_lock()
@@ -1375,28 +1389,15 @@ class Session(Closeable, MessageListener, SubListener):
                     self.__auth_lock_bool = False
                     self.__auth_lock.notify_all()
             if self.__inner.conf.store_credentials:
-                reusable = self.__ap_welcome.reusable_auth_credentials
-                reusable_type = Authentication.AuthenticationType.Name(
-                    self.__ap_welcome.reusable_auth_credentials_type)
+                self.__stored_str = base64.b64encode(
+                    json.dumps(self.credentials()).encode()
+                    ).decode()
                 if self.__inner.conf.stored_credentials_file is None:
                     raise TypeError(
                         "The file path to be saved is not specified")
-                self.__stored_str = base64.b64encode(
-                    json.dumps({
-                        "username":
-                        self.__ap_welcome.canonical_username,
-                        "credentials":
-                        base64.b64encode(reusable).decode(),
-                        "type":
-                        reusable_type,
-                    }).encode()).decode()
                 with open(self.__inner.conf.stored_credentials_file, "w") as f:
                     json.dump(
-                        {
-                            "username": self.__ap_welcome.canonical_username,
-                            "credentials": base64.b64encode(reusable).decode(),
-                            "type": reusable_type,
-                        },
+                        self.credentials(),
                         f,
                     )
 
