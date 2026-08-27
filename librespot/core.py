@@ -1616,12 +1616,12 @@ class Session(Closeable, MessageListener, SubListener):
             else:
                 try:
                     self.login_credentials = Authentication.LoginCredentials(
-                        typ=Authentication.AuthenticationType.Value(
-                            obj["type"]),
+                        typ=obj.get("auth_type") or Authentication.AuthenticationType.Value(obj["type"]),
                         username=obj["username"],
-                        auth_data=base64.b64decode(obj["credentials"]),
+                        auth_data=base64.b64decode(obj.get("auth_data") or obj["credentials"]),
                     )
-                except KeyError:
+                except KeyError as e:
+                    self.logger.error("The stored credentials must contains these keys: username, auth_type or type, auth_data or credentials")
                     pass
             return self
 
@@ -1643,23 +1643,14 @@ class Session(Closeable, MessageListener, SubListener):
                     pass
                 else:
                     try:
-                        # Try Python librespot format first
                         self.login_credentials = Authentication.LoginCredentials(
-                            typ=Authentication.AuthenticationType.Value(
-                                obj["type"]),
+                            typ=obj.get("auth_type") or Authentication.AuthenticationType.Value(obj["type"]),
                             username=obj["username"],
-                            auth_data=base64.b64decode(obj["credentials"]),
+                            auth_data=base64.b64decode(obj.get("auth_data") or obj["credentials"]),
                         )
                     except KeyError:
-                        # Try Rust librespot format (auth_type as int, auth_data instead of credentials)
-                        try:
-                            self.login_credentials = Authentication.LoginCredentials(
-                                typ=obj["auth_type"],
-                                username=obj["username"],
-                                auth_data=base64.b64decode(obj["auth_data"]),
-                            )
-                        except KeyError:
-                            pass
+                        self.logger.error("The stored credentials must contains these keys: username, auth_type or type, auth_data or credentials")
+                        pass
             return self
 
         def oauth(self, oauth_url_callback, success_page_content = None) -> Session.Builder:
