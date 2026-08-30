@@ -43,6 +43,7 @@ from librespot.crypto import Packet
 from librespot.mercury import MercuryClient
 from librespot.mercury import MercuryRequests
 from librespot.mercury import RawMercuryRequest
+from librespot.metadata import Id
 from librespot.metadata import AlbumId
 from librespot.metadata import ArtistId
 from librespot.metadata import EpisodeId
@@ -192,6 +193,64 @@ class ApiClient(Closeable):
             self.logger.warning("PUT state returned {}. headers: {}".format(
                 response.status_code, response.headers))
 
+    def get_ext_metadata_batched(self, extension_kinds: list[ExtensionKind], uris: list[str]) -> list[typing.Optional[bytes]]:
+        reqs = []
+        for ext, uri in zip(extension_kinds, uris):
+            reqs.append(EntityRequest(entity_uri=uri, query=[ExtensionQuery(extension_kind=ext),]))
+
+        headers = CaseInsensitiveDict({"content-type": "application/x-protobuf"})
+        response = self.send("POST", "/extended-metadata/v0/extended-metadata",
+                             headers, BatchedEntityRequest(entity_request=reqs).SerializeToString())
+        ApiClient.StatusCodeException.check_status(response)
+
+        body = response.content
+        if body is None:
+            raise ConnectionError("Extended Metadata request for batch failed: No response body")
+
+        proto = BatchedExtensionResponse()
+        proto.ParseFromString(body)
+
+        mdbs: list[bytes] = [None]*len(uris)
+        for extension_kind in proto.extended_metadata:
+            for query_resp in extension_kind.extension_data:
+                uri = query_resp.entity_uri
+                status_code = query_resp.header.status_code
+                if status_code != 200:
+                    # raise ConnectionError("Extended Metadata request for {} failed: Status code {}".format(uri, status_code))
+                    continue
+                mdbs[uris.index(uri)] = query_resp.extension_data.value
+        return mdbs
+
+    def get_metadata_4_multiple(self, items: list[Id]) -> list:
+        if any(isinstance(item, PlaylistId) for item in items):
+            raise NotImplementedError("PlaylsitId cannot retreive metadata via batched endpoint")
+
+        extension_kind_map = {
+            TrackId: ExtensionKind.TRACK_V4,
+            EpisodeId: ExtensionKind.EPISODE_V4,
+            AlbumId: ExtensionKind.ALBUM_V4,
+            ArtistId: ExtensionKind.ARTIST_V4,
+            ShowId: ExtensionKind.SHOW_V4,
+        }
+
+        extension_kinds = [extension_kind_map[item.__class__] for item in items]
+        item_uris = [item.to_spotify_uri() for item in items]
+        mdbs = self.get_ext_metadata_batched(extension_kinds, item_uris)
+
+        metadata_kind_map = {
+            TrackId: Metadata.Track,
+            EpisodeId: Metadata.Episode,
+            AlbumId: Metadata.Album,
+            ArtistId: Metadata.Artist,
+            ShowId: Metadata.Show,
+        }
+
+        mds = [metadata_kind_map[item.__class__]() for item in items]
+        for md, mdb in zip(mds, mdbs):
+            if mdb:
+                md.ParseFromString(mdb)
+        return mds
+
     def get_ext_metadata(self, extension_kind: ExtensionKind, uri: str):
         headers = CaseInsensitiveDict({"content-type": "application/x-protobuf"})
         req = EntityRequest(entity_uri=uri, query=[ExtensionQuery(extension_kind=extension_kind),])
@@ -230,6 +289,10 @@ class ApiClient(Closeable):
 
         """
         mdb = self.get_ext_metadata(ExtensionKind.EPISODE_V4, episode.to_spotify_uri())
+        # mdb = self.get_ext_metadata_batched([ExtensionKind.EPISODE_V4,
+        #                                      ExtensionKind.TRACK_V4],
+        #                                     [episode.to_spotify_uri(),
+        #                                     'spotify:track:5EeQQ8BVJTRkp1AIKJILGY'])
         md = Metadata.Episode()
         md.ParseFromString(mdb)
         return md
