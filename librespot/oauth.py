@@ -90,7 +90,7 @@ class OAuth:
         if not self.__code:
             raise RuntimeError("You need to provide a code before!")
 
-        request_data = self.__spotify_token_data
+        request_data = self.__spotify_token_data.copy()
         request_data["grant_type"] = "authorization_code"
         request_data["client_id"] = self.__client_id
         request_data["redirect_uri"] = self.__redirect_url
@@ -101,6 +101,7 @@ class OAuth:
             self.__spotify_token,
             headers=CaseInsensitiveDict({"Content-Type": "application/x-www-form-urlencoded"}),
             data=request_data,
+            timeout=(10, 30),
         )
         if response.status_code != 200:
             raise RuntimeError("Received status code %d: %s" % (response.status_code, response.reason))
@@ -113,7 +114,7 @@ class OAuth:
         if self.__token_expires_at > datetime.now():
             return self
 
-        request_data = self.__spotify_token_data
+        request_data = self.__spotify_token_data.copy()
         request_data["grant_type"] = "refresh_token"
         request_data["client_id"] = self.__client_id
         request_data["refresh_token"] = self.__refresh_token
@@ -122,6 +123,7 @@ class OAuth:
             self.__spotify_token,
             headers=CaseInsensitiveDict({"Content-Type": "application/x-www-form-urlencoded"}),
             data=request_data,
+            timeout=(10, 30),
         )
         if response.status_code != 200:
             raise RuntimeError("Received status code %d: %s" % (response.status_code, response.reason))
@@ -211,14 +213,20 @@ class OAuth:
             self.__server_timeout
         )
         logging.info("OAuth: Waiting for callback on %s", url.hostname + ":" + str(url.port))
-        self.__start_server()
+        try:
+            self.__start_server()
+        finally:
+            self.__server.server_close()
 
     def flow(self):
         logging.info("OAuth: Visit in your browser and log in: %s ", self.get_auth_url())
         self.run_callback_server()
-        self.request_token()
+        try:
+            self.request_token()
+        except requests.Timeout as exc:
+            raise RuntimeError("Spotify token exchange timed out (10s connect / 30s read). Check connectivity to accounts.spotify.com and retry authorization.") from exc
         return self.get_credentials()
 
     def close(self):
         if self.__server:
-            self.__server.shutdown()
+            self.__server.server_close()
