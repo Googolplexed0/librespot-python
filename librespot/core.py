@@ -450,7 +450,7 @@ class ApResolver:
 
         """
         response = requests.get("{}?type={}".format(ApResolver.base_url,
-                                                    service_type))
+                                                    service_type), timeout=(10, 30))
         if response.status_code != 200:
             if response.status_code == 502:
                 raise RuntimeError(
@@ -1239,7 +1239,10 @@ class Session(Closeable, MessageListener, SubListener):
         return client
 
     def credentials(self) -> dict:
-        ap_welcome = self.ap_welcome()
+        # Persistence runs before authentication finishes; never wait on our own login.
+        ap_welcome = getattr(self, '_Session__ap_welcome', None)
+        if ap_welcome is None:
+            raise RuntimeError('Session has not received a welcome packet')
         reusable = ap_welcome.reusable_auth_credentials
         reusable_type = Authentication.AuthenticationType.Name(
             ap_welcome.reusable_auth_credentials_type)
@@ -1430,7 +1433,14 @@ class Session(Closeable, MessageListener, SubListener):
         self.__send_unchecked(
             Packet.Type.login,
             client_response_encrypted_proto.SerializeToString())
-        packet = self.cipher_pair.receive_encoded(self.connection)
+        self.connection.set_timeout(30)
+        try:
+            packet = self.cipher_pair.receive_encoded(self.connection)
+        except (RuntimeError, OSError) as exc:
+            self.connection.close()
+            raise RuntimeError("Spotify session authentication did not complete: " + str(exc)) from exc
+        else:
+            self.connection.set_timeout(0)
         if packet.is_cmd(Packet.Type.ap_welcome):
             self.__ap_welcome = Authentication.APWelcome()
             self.__ap_welcome.ParseFromString(packet.payload)
@@ -1990,7 +2000,12 @@ class Session(Closeable, MessageListener, SubListener):
             ap_address = address.split(":")[0]
             ap_port = int(address.split(":")[1])
             sock = socket.socket()
-            sock.connect((ap_address, ap_port))
+            sock.settimeout(30)
+            try:
+                sock.connect((ap_address, ap_port))
+            except BaseException:
+                sock.close()
+                raise
             return Session.ConnectionHolder(sock)
 
         def close(self) -> None:
