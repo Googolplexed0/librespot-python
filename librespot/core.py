@@ -75,6 +75,7 @@ class ApiClient(Closeable):
     __base_url: str
     __client_token_str: str = None
     __session: Session
+    request_timeout = (10, 30)
 
     def __init__(self, session: Session):
         self.__session = session
@@ -141,7 +142,8 @@ class ApiClient(Closeable):
 
         """
         response = self.__session.client().send(
-            self.build_request(method, suffix, headers, body, None))
+            self.build_request(method, suffix, headers, body, None),
+            timeout=self.request_timeout)
         return response
 
     def sendToUrl(
@@ -165,7 +167,8 @@ class ApiClient(Closeable):
 
         """
         response = self.__session.client().send(
-            self.build_request(method, suffix, headers, body, url))
+            self.build_request(method, suffix, headers, body, url),
+            timeout=self.request_timeout)
         return response
 
     def put_connect_state(self, connection_id: str,
@@ -410,6 +413,7 @@ class ApiClient(Closeable):
                 "Accept": "application/x-protobuf",
                 "Content-Encoding": "",
             }),
+            timeout=self.request_timeout,
         )
 
         ApiClient.StatusCodeException.check_status(resp)
@@ -1104,6 +1108,7 @@ class Session(Closeable, MessageListener, SubListener):
             self.__dealer_client.close()
             self.__dealer_client = None
         if self.__audio_key_manager is not None:
+            self.__audio_key_manager.close()
             self.__audio_key_manager = None
         if self.__channel_manager is not None:
             self.__channel_manager.close()
@@ -1345,6 +1350,9 @@ class Session(Closeable, MessageListener, SubListener):
 
     def reconnect(self) -> None:
         """Reconnect to the Spotify Server"""
+        if self.__audio_key_manager is not None:
+            self.__audio_key_manager.cancel_pending(
+                ConnectionError("Spotify session reconnected during audio-key request"))
         if self.connection is not None:
             self.connection.close()
             self.__receiver.stop()
@@ -2001,7 +2009,7 @@ class Session(Closeable, MessageListener, SubListener):
             """Flush data to socket"""
             try:
                 self.__buffer.seek(0)
-                self.__socket.send(self.__buffer.read())
+                self.__socket.sendall(self.__buffer.read())
                 self.__buffer = io.BytesIO()
             except BrokenPipeError:
                 pass
@@ -2144,7 +2152,16 @@ class Session(Closeable, MessageListener, SubListener):
                     if self.__running:
                         self.__session.logger.fatal(
                             "Failed reading packet! {}".format(ex))
-                        self.__session.reconnect()
+                        try:
+                            self.__session.reconnect()
+                        except Exception:
+                            # Do not leave a half-authenticated Session alive.
+                            # The caller can create a fresh Session from stored
+                            # credentials after the next operation observes it
+                            # as closed. Also wake pending audio-key requests.
+                            self.__session.logger.exception(
+                                "Session reconnect failed; closing the broken session")
+                            self.__session.close()
                     break
                 if not self.__running:
                     break
@@ -2424,7 +2441,8 @@ class TokenProvider:
                 headers=CaseInsensitiveDict({
                     "Content-Type": "application/x-protobuf",
                     "Accept": "application/x-protobuf"
-                    }))
+                    }),
+                timeout=(10, 30))
 
             if response.status_code == 200:
                 login5_response = Login5.LoginResponse()

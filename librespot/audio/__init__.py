@@ -13,7 +13,6 @@ import concurrent.futures
 import io
 import logging
 import math
-import queue
 import random
 import struct
 import threading
@@ -26,26 +25,29 @@ if typing.TYPE_CHECKING:
 
 
 class AbsChunkedInputStream(io.BytesIO, HaltListener):
-    chunk_exception = None
-    closed = False
-    max_chunk_tries = 128
+    max_chunk_tries = 3
     preload_ahead = 3
     preload_chunk_retries = 2
     retries: typing.List[int]
     retry_on_chunk_error: bool
-    wait_lock: threading.Condition = threading.Condition()
-    wait_for_chunk = -1
     __decoded_length = 0
     __mark = 0
     __pos = 0
 
     def __init__(self, retry_on_chunk_error: bool):
         super().__init__()
+        self._stream_closed = False
+        self.wait_lock = threading.Condition()
+        self.wait_for_chunk = -1
+        self.chunk_errors: typing.Dict[int, Exception] = {}
+        self.__decoded_length = 0
+        self.__mark = 0
+        self.__pos = 0
         self.retries = [0] * self.chunks()
         self.retry_on_chunk_error = retry_on_chunk_error
 
     def is_closed(self) -> bool:
-        return self.closed
+        return self._stream_closed
 
     def buffer(self) -> typing.List[bytes]:
         raise NotImplementedError()
@@ -54,8 +56,9 @@ class AbsChunkedInputStream(io.BytesIO, HaltListener):
         raise NotImplementedError()
 
     def close(self) -> None:
-        self.closed = True
         with self.wait_lock:
+            self._stream_closed = True
+            super().close()
             self.wait_lock.notify_all()
 
     def available(self):
@@ -76,7 +79,7 @@ class AbsChunkedInputStream(io.BytesIO, HaltListener):
     def seek(self, where: int, **kwargs) -> None:
         if where < 0:
             raise TypeError()
-        if self.closed:
+        if self._stream_closed:
             raise IOError("Stream is closed!")
         self.__pos = where
         self.check_availability(int(self.__pos / (128 * 1024)), False, False)
@@ -84,7 +87,7 @@ class AbsChunkedInputStream(io.BytesIO, HaltListener):
     def skip(self, n: int) -> int:
         if n < 0:
             raise TypeError()
-        if self.closed:
+        if self._stream_closed:
             raise IOError("Stream is closed!")
         k = self.size() - self.__pos
         if n < k:
@@ -107,49 +110,67 @@ class AbsChunkedInputStream(io.BytesIO, HaltListener):
         raise NotImplementedError()
 
     def should_retry(self, chunk: int) -> bool:
-        if self.retries[chunk] < 1:
-            return True
-        if self.retries[chunk] > self.max_chunk_tries:
-            return False
-        return self.retry_on_chunk_error
+        # Permit one recovery attempt even when optional retries are disabled;
+        # then cap retries so a permanently failing CDN cannot stall forever.
+        return self.retries[chunk] < self.max_chunk_tries and (
+            self.retries[chunk] <= 1 or self.retry_on_chunk_error)
 
     def check_availability(self, chunk: int, wait: bool, halted: bool) -> None:
         if halted and not wait:
             raise TypeError()
-        if not self.requested_chunks()[chunk]:
-            self.request_chunk_from_stream(chunk)
-            self.requested_chunks()[chunk] = True
-        for i in range(chunk + 1,
-                       min(self.chunks() - 1, chunk + self.preload_ahead) + 1):
-            if (self.requested_chunks()[i]
-                    and self.retries[i] < self.preload_chunk_retries):
-                self.request_chunk_from_stream(i)
-                self.requested_chunks()[chunk] = True
-        if wait:
-            if self.available_chunks()[chunk]:
+        while True:
+            request = False
+            prefetch = []
+            retry_error = None
+            with self.wait_lock:
+                if self._stream_closed:
+                    raise IOError("Stream is closed!")
+                if self.available_chunks()[chunk]:
+                    return
+                retry_error = self.chunk_errors.pop(chunk, None)
+                if retry_error is not None:
+                    if not self.should_retry(chunk):
+                        raise AbsChunkedInputStream.ChunkException(
+                            "Failed to fetch chunk {} after {} attempts".format(
+                                chunk, self.retries[chunk])) from retry_error
+                    self.requested_chunks()[chunk] = False
+                if not self.requested_chunks()[chunk]:
+                    self.requested_chunks()[chunk] = True
+                    request = True
+                if request:
+                    for index in range(
+                            chunk + 1,
+                            min(self.chunks(), chunk + self.preload_ahead + 1)):
+                        if (not self.requested_chunks()[index]
+                                and self.retries[index] < self.preload_chunk_retries):
+                            self.requested_chunks()[index] = True
+                            prefetch.append(index)
+
+            if retry_error is not None:
+                time.sleep(min(0.25 * (2 ** (self.retries[chunk] - 1)), 2.0))
+            if request:
+                self.request_chunk_from_stream(chunk)
+                for index in prefetch:
+                    self.request_chunk_from_stream(index)
+            if not wait:
                 return
-            retry = False
+
             with self.wait_lock:
                 if not halted:
                     self.stream_read_halted(chunk, int(time.time() * 1000))
-                self.chunk_exception = None
                 self.wait_for_chunk = chunk
-                self.wait_lock.wait_for(lambda: self.available_chunks()[chunk])
-                if self.closed:
-                    return
-                if self.chunk_exception is not None:
-                    if self.should_retry(chunk):
-                        retry = True
-                    else:
-                        raise AbsChunkedInputStream.ChunkException
-                if not retry:
+                self.wait_lock.wait_for(
+                    lambda: self._stream_closed or self.available_chunks()[chunk]
+                    or chunk in self.chunk_errors)
+                self.wait_for_chunk = -1
+                if self._stream_closed:
+                    raise IOError("Stream is closed!")
+                if self.available_chunks()[chunk]:
                     self.stream_read_halted(chunk, int(time.time() * 1000))
-            if retry:
-                time.sleep(math.log10(self.retries[chunk]))
-                self.check_availability(chunk, True, True)
+                    return
 
     def read(self, __size: int = 0) -> bytes:
-        if self.closed:
+        if self._stream_closed:
             raise IOError("Stream is closed!")
         if __size <= 0:
             if self.__pos == self.size():
@@ -196,22 +217,25 @@ class AbsChunkedInputStream(io.BytesIO, HaltListener):
         return buffer.read()
 
     def notify_chunk_available(self, index: int) -> None:
-        self.available_chunks()[index] = True
-        self.__decoded_length += len(self.buffer()[index])
         with self.wait_lock:
-            if index == self.wait_for_chunk and not self.closed:
-                self.wait_for_chunk = -1
-                self.wait_lock.notify_all()
+            if self._stream_closed:
+                return
+            self.available_chunks()[index] = True
+            self.chunk_errors.pop(index, None)
+            self.__decoded_length += len(self.buffer()[index])
+            # More than one reader can wait on different chunks in the same
+            # condition. Wake all; each reader rechecks its own predicate.
+            self.wait_lock.notify_all()
 
     def notify_chunk_error(self, index: int, ex):
-        self.available_chunks()[index] = False
-        self.requested_chunks()[index] = False
-        self.retries[index] += 1
         with self.wait_lock:
-            if index == self.wait_for_chunk and not self.closed:
-                self.chunk_exception = ex
-                self.wait_for_chunk = -1
-                self.wait_lock.notify_all()
+            if self._stream_closed:
+                return
+            self.available_chunks()[index] = False
+            self.requested_chunks()[index] = False
+            self.retries[index] += 1
+            self.chunk_errors[index] = ex
+            self.wait_lock.notify_all()
 
     def decoded_length(self):
         return self.__decoded_length
@@ -227,19 +251,21 @@ class AbsChunkedInputStream(io.BytesIO, HaltListener):
 class AudioKeyManager(PacketsReceiver, Closeable):
     audio_key_request_timeout = 20
     logger = logging.getLogger("Librespot:AudioKeyManager")
-    __callbacks: typing.Dict[int, Callback] = {}
-    __seq_holder = 0
-    __seq_holder_lock = threading.Condition()
     __session: Session
     __zero_short = b"\x00\x00"
 
     def __init__(self, session: Session):
         self.__session = session
+        self.__callbacks: typing.Dict[int, AudioKeyManager.SyncCallback] = {}
+        self.__seq_holder = 0
+        self.__seq_holder_lock = threading.Lock()
+        self.__closed = False
 
     def dispatch(self, packet: Packet) -> None:
         payload = io.BytesIO(packet.payload)
         seq = struct.unpack(">i", payload.read(4))[0]
-        callback = self.__callbacks.get(seq)
+        with self.__seq_holder_lock:
+            callback = self.__callbacks.get(seq)
         if callback is None:
             self.logger.warning(
                 "Couldn't find callback for seq: {}".format(seq))
@@ -259,20 +285,37 @@ class AudioKeyManager(PacketsReceiver, Closeable):
                       gid: bytes,
                       file_id: bytes,
                       retry: bool = True) -> bytes:
+        callback = AudioKeyManager.SyncCallback(self)
         seq: int
         with self.__seq_holder_lock:
+            if self.__closed:
+                raise ConnectionError("Audio key manager is closed")
             seq = self.__seq_holder
             self.__seq_holder += 1
+            # Install the callback before writing to the socket; the receiver
+            # thread can process a fast response before send() returns.
+            self.__callbacks[seq] = callback
         out = io.BytesIO()
         out.write(file_id)
         out.write(gid)
         out.write(struct.pack(">i", seq))
         out.write(self.__zero_short)
         out.seek(0)
-        self.__session.send(Packet.Type.request_key, out.read())
-        callback = AudioKeyManager.SyncCallback(self)
-        self.__callbacks[seq] = callback
-        key = callback.wait_response()
+        timeout_error = None
+        try:
+            self.__session.send(Packet.Type.request_key, out.read())
+            key = callback.wait_response()
+        except TimeoutError as exc:
+            timeout_error = exc
+        finally:
+            with self.__seq_holder_lock:
+                self.__callbacks.pop(seq, None)
+        if timeout_error is not None:
+            if retry:
+                return self.get_audio_key(gid, file_id, False)
+            raise RuntimeError(
+                "Failed fetching audio key! gid: {}, fileId: {}".format(
+                    util.bytes_to_hex(gid), util.bytes_to_hex(file_id))) from timeout_error
         if key is None:
             if retry:
                 return self.get_audio_key(gid, file_id, False)
@@ -280,6 +323,19 @@ class AudioKeyManager(PacketsReceiver, Closeable):
                 "Failed fetching audio key! gid: {}, fileId: {}".format(
                     util.bytes_to_hex(gid), util.bytes_to_hex(file_id)))
         return key
+
+    def cancel_pending(self, error: Exception) -> None:
+        with self.__seq_holder_lock:
+            callbacks = list(self.__callbacks.values())
+        for callback in callbacks:
+            callback.fail(error)
+
+    def close(self) -> None:
+        with self.__seq_holder_lock:
+            self.__closed = True
+            callbacks = list(self.__callbacks.values())
+        for callback in callbacks:
+            callback.fail(ConnectionError("Audio key manager is closed"))
 
     class Callback:
 
@@ -291,29 +347,46 @@ class AudioKeyManager(PacketsReceiver, Closeable):
 
     class SyncCallback(Callback):
         __audio_key_manager: AudioKeyManager
-        __reference = queue.Queue()
-        __reference_lock = threading.Condition()
 
         def __init__(self, audio_key_manager: AudioKeyManager):
             self.__audio_key_manager = audio_key_manager
+            self.__event = threading.Event()
+            self.__lock = threading.Lock()
+            self.__result = None
+            self.__error: typing.Optional[Exception] = None
+            self.__completed = False
+
+        def _complete(self, result=None, error=None) -> None:
+            with self.__lock:
+                if self.__completed:
+                    return
+                self.__completed = True
+                self.__result = result
+                self.__error = error
+                self.__event.set()
 
         def key(self, key: bytes) -> None:
-            with self.__reference_lock:
-                self.__reference.put(key)
-                self.__reference_lock.notify_all()
+            self._complete(result=key)
 
         def error(self, code: int) -> None:
             self.__audio_key_manager.logger.fatal(
                 "Audio key error, code: {}".format(code))
-            with self.__reference_lock:
-                self.__reference.put(None)
-                self.__reference_lock.notify_all()
+            self._complete(error=RuntimeError(
+                "Spotify rejected the audio-key request with error code {}".format(code)))
+
+        def fail(self, error: Exception) -> None:
+            self._complete(error=error)
 
         def wait_response(self) -> bytes:
-            with self.__reference_lock:
-                self.__reference_lock.wait(
-                    AudioKeyManager.audio_key_request_timeout)
-                return self.__reference.get(block=False)
+            if not self.__event.wait(AudioKeyManager.audio_key_request_timeout):
+                with self.__lock:
+                    # A callback may win the timeout race just as wait returns.
+                    if not self.__completed:
+                        raise TimeoutError("Timed out waiting for audio key")
+            with self.__lock:
+                if self.__error is not None:
+                    raise self.__error
+                return self.__result
 
 
 class CdnFeedHelper:
@@ -330,7 +403,7 @@ class CdnFeedHelper:
     def load_episode_external(
             session: Session, episode: Metadata.Episode,
             halt_listener: HaltListener) -> LoadedStream:
-        resp = session.client().head(episode.external_url)
+        resp = session.client().head(episode.external_url, timeout=(10, 30))
 
         if resp.status_code != 200:
             CdnFeedHelper._LOGGER.warning("Couldn't resolve redirect!")
@@ -388,7 +461,8 @@ class CdnManager:
     def get_head(self, file_id: bytes):
         response = self.__session.client() \
             .get(self.__session.get_user_attribute("head-files-url", "https://heads-fa.spotify.com/head/{file_id}")
-                 .replace("{file_id}", util.bytes_to_hex(file_id)))
+                 .replace("{file_id}", util.bytes_to_hex(file_id)),
+                 timeout=(10, 30))
         if response.status_code != 200:
             raise IOError("{}".format(response.status_code))
         body = response.content
@@ -607,6 +681,7 @@ class CdnManager:
                 headers=CaseInsensitiveDict({
                     "Range": "bytes={}-{}".format(range_start, range_end)
                 }),
+                timeout=(10, 30),
             )
             if response.status_code != 206:
                 raise IOError(response.status_code)
@@ -642,8 +717,13 @@ class CdnManager:
                 return self.streamer.chunks
 
             def request_chunk_from_stream(self, index: int) -> None:
-                self.streamer.executor_service \
-                    .submit(lambda: self.streamer.request_chunk(index))
+                def request_and_report_error() -> None:
+                    try:
+                        self.streamer.request_chunk(index)
+                    except Exception as exc:
+                        self.notify_chunk_error(index, exc)
+
+                self.streamer.executor_service.submit(request_and_report_error)
 
             def stream_read_halted(self, chunk: int, _time: int) -> None:
                 if self.streamer.halt_listener is not None:
