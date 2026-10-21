@@ -2,6 +2,7 @@ import setuptools
 
 setuptools.setup(name="librespot",
                  version="0.0.15",
+                 python_requires=">=3.10",
                  description="Open Source Spotify Client",
                  long_description=open("README.md").read(),
                  long_description_content_type="text/markdown",
