@@ -3,6 +3,9 @@ import logging
 import random
 import urllib
 import json
+import os
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 from hashlib import sha256
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
@@ -139,14 +142,27 @@ class OAuth:
         return self.__token
 
     def save_creds(self, cred_path: str):
-        with open(cred_path, 'w',) as f:
-            json.dump({
+        path = Path(cred_path)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temp_path = None
+        try:
+            with NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
+                                    prefix=f'.{path.name}-', delete=False) as f:
+                temp_path = Path(f.name)
+                temp_path.chmod(0o600)
+                json.dump({
                 "client_id": self.__client_id,
                 "access_token": self.__token,
                 "expires_at": self.__token_expires_at.timestamp(),
                 "refresh_token": self.__refresh_token,
                 "type": self.OAUTH_PKCE_TOKEN
-            }, f)
+                }, f)
+                f.flush()
+                os.fsync(f.fileno())
+            temp_path.replace(path)
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
 
     def get_credentials(self):
         if not self.__token:
