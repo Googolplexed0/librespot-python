@@ -22,7 +22,8 @@ pip install -r requirements.txt
 > which will subsequently require using the protoc compiler to generate updated versions of 
 > the `*_pb2.py` Python stubs that implement serialization/deserialization for those schemas.
 
-- Go to the [protobuf release matching the version pinned in `requirements.txt`](https://github.com/protocolbuffers/protobuf/releases/tag/v3.20.1).
+- Use protoc 36.1, which emits Python gencode 7.36.1; the supported runtime is
+  protobuf 7.36.2 or newer within major version 7.
 - Download and install the `protoc-*.zip` file meant for your platform.
 
 After modifying the `.proto` files you need to, **make sure to follow [these steps](#protocol-buffer-generation) to regenerate the Python stubs**.
@@ -34,14 +35,11 @@ After modifying the `.proto` files you need to, **make sure to follow [these ste
 - From the repository root, conveniently recompile all `.proto` schema files with this command:
 
     ```bash
-    find proto -name "*.proto" | xargs protoc -I=proto --python_out=librespot/proto
+    python dev/regenerate_protos.py
     ```
 
-- Alternatively, to recompile a single file (e.g. `proto/metadata.proto`), run:
-
-    ```bash
-    protoc -I=proto --python_out=librespot/proto proto/metadata.proto
-    ```
+- The helper preserves the existing CamelCase module filenames and package-local
+  imports. Run the offline checks in `tests/README.md` after generation.
 
 - Commit both the source `.proto` and the regenerated Python output **together** so they can
 be compared easily.
